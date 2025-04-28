@@ -1,0 +1,49 @@
+name: localstack-sample
+services:
+  localstack:
+    image: localstack/localstack:3.7.2
+    container_name: localstack-sample
+    ports:
+      - "127.0.0.1:4566:4566"  # LocalStack Gateway
+    environment:
+      - SERVICES=s3,lambda
+      - DEBUG=1
+    volumes:
+      - "./localstack/init.sh:/etc/localstack/init/ready.d/init.sh" # 初期化スクリプト
+      - "./localstack/volume:/var/lib/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      retries: 5
+    networks:
+      ls:
+        ipv4_address: 10.0.2.20
+  
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: app
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      - S3_ENDPOINT_URL=http://s3.localhost.localstack.cloud:4566
+      - OTHER_ENDPOINT_URL=http://localstack:4566
+      - AWS_ACCESS_KEY_ID=dummy
+      - AWS_SECRET_ACCESS_KEY=dummy
+      - AWS_REGION=ap-northeast-1
+      - BUCKET_NAME=test-bucket
+    depends_on:
+      localstack:
+        condition: service_healthy
+    dns:
+      - 10.0.2.20 # LocalStackのDNS
+    networks:
+      - ls
+
+networks:
+  ls:
+    ipam:
+      config:
+        - subnet: 10.0.2.0/24
