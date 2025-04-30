@@ -5,7 +5,7 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 
-COPY main.go ./
+COPY app/main.go ./
 RUN GOOS=linux CGO_ENABLED=0 go build -o /app/main --trimpath --ldflags '-w -s' .
 
 
