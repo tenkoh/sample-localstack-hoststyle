@@ -5,8 +5,9 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 
-COPY app/main.go ./
-RUN GOOS=linux CGO_ENABLED=0 go build -o /app/main --trimpath --ldflags '-w -s' .
+COPY app/main.go ./app/
+COPY presigner/presigner.go ./presigner/
+RUN GOOS=linux CGO_ENABLED=0 go build -o /app/main --trimpath --ldflags '-w -s' ./app/main.go
 
 
 FROM gcr.io/distroless/static-debian12:latest

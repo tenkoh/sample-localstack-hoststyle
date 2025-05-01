@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"log"
@@ -11,7 +12,9 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/tenkoh/sample-localstack-hoststyle/presigner"
 )
 
 const topTemplate = `<!DOCTYPE html>
@@ -22,16 +25,14 @@ const topTemplate = `<!DOCTYPE html>
   <title>LocalStack example: S3 virtual host style URL</title>
 </head>
 <body>
-  <h2>{{ .AnotherContainer.Title }}</h2>
-  <p>Download from: {{ .AnotherContainer.Host }}</p>
-  <a href="{{ .AnotherContainer.PresignedUrl }}">Download</a>
+  {{ range $index, $content := . }}
+	<h2>{{ $content.Title }}</h2>
+	<p>Download from: {{ $content.Host }}</p>
+	<a href="{{ $content.PresignedUrl }}">Download</a>
+  {{ end }}
 </body>
 </html>
 `
-
-type topContent struct {
-	AnotherContainer content
-}
 
 type content struct {
 	Title        string
@@ -39,81 +40,95 @@ type content struct {
 	PresignedUrl string
 }
 
-type presigner struct {
-	client *s3.PresignClient
-	bucket string
-}
-
-func NewPresigner(ctx context.Context, bucket string) (*presigner, error) {
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(os.Getenv("AWS_REGION")))
+func parseContent(title, urlString string) (content, error) {
+	u, err := url.Parse(urlString)
 	if err != nil {
-		return nil, fmt.Errorf("unable to load SDK config, %v", err)
+		return content{}, fmt.Errorf("failed to parse url: %s, %w", urlString, err)
 	}
-	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		// o.EndpointResolverV2 = &resolverV2{}
-		o.BaseEndpoint = aws.String(os.Getenv("S3_ENDPOINT_URL"))
-	})
-	return &presigner{
-		client: s3.NewPresignClient(client),
-		bucket: bucket,
+	return content{
+		Title:        title,
+		Host:         u.Hostname(),
+		PresignedUrl: urlString,
 	}, nil
 }
 
-func (p *presigner) PresignedURL(ctx context.Context, key string) (string, error) {
-	req, err := p.client.PresignGetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(p.bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to presign request, key: %s, %w", key, err)
-	}
-	return req.URL, nil
-}
-
-func mustParseUrl(s string) *url.URL {
-	u, err := url.Parse(s)
-	if err != nil {
-		panic(fmt.Sprintf("failed to parse url: %s, %v", s, err))
-	}
-	return u
-}
-
-func mainHandler(p *presigner, targetKey string) http.HandlerFunc {
+func mainHandler(s3Client *s3.PresignClient, lambdaClient *lambda.Client, bucket, key string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		pu, err := p.PresignedURL(r.Context(), targetKey)
+		w.Header().Set("Content-Type", "text/html")
+		s3Content, err := getPresignInApp(r.Context(), s3Client, bucket, key)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to get object. Key: %s. Detail: %v", targetKey, err), http.StatusNotFound)
+			http.Error(w, fmt.Sprintf("Failed to get presign in app: %v", err), http.StatusInternalServerError)
 			return
 		}
-		u := mustParseUrl(pu)
-		host := u.Hostname()
 
-		// view
-		w.Header().Set("Content-Type", "text/html")
-		content := topContent{
-			AnotherContainer: content{
-				Title:        "Created by SDK in another container",
-				Host:         host,
-				PresignedUrl: pu,
-			},
+		lambdaContent, err := getPresignInLambda(r.Context(), lambdaClient, bucket, key)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to get presign in lambda: %v", err), http.StatusInternalServerError)
+			return
 		}
+
 		tmpl := template.Must(template.New("top").Parse(topTemplate))
-		if tmpl.Execute(w, content) != nil {
+		if err := tmpl.Execute(w, []content{s3Content, lambdaContent}); err != nil {
 			http.Error(w, fmt.Sprintf("Failed to execute template: %v", err), http.StatusInternalServerError)
 			return
 		}
 	}
 }
 
+func getPresignInApp(ctx context.Context, client *s3.PresignClient, bucket string, key string) (content, error) {
+	p, err := presigner.NewPresigner(client, bucket).PresignedURL(ctx, key)
+	if err != nil {
+		return content{}, fmt.Errorf("failed to presign URL: %w", err)
+	}
+	return parseContent("Created by SDK in app", p)
+}
+
+func getPresignInLambda(ctx context.Context, client *lambda.Client, bucket string, key string) (content, error) {
+	payload, err := json.Marshal(map[string]string{"key": key})
+	if err != nil {
+		return content{}, fmt.Errorf("failed to marshal payload: %w", err)
+	}
+	req := &lambda.InvokeInput{
+		FunctionName: aws.String("presign-function"),
+		Payload:      payload,
+	}
+	resp, err := client.Invoke(ctx, req)
+	if err != nil {
+		return content{}, fmt.Errorf("failed to invoke lambda: %w", err)
+	}
+	if resp.StatusCode != 200 {
+		return content{}, fmt.Errorf("lambda returned non-200 status code: %d", resp.StatusCode)
+	}
+	var presignResponse struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(resp.Payload, &presignResponse); err != nil {
+		return content{}, fmt.Errorf("failed to unmarshal lambda response: %w", err)
+	}
+	return parseContent("Created by SDK in Lambda", presignResponse.URL)
+}
+
 func main() {
 	ctx := context.Background()
 	bucket := os.Getenv("BUCKET_NAME")
-	presigner, err := NewPresigner(ctx, bucket)
+	objectKey := "test.txt"
+
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(os.Getenv("AWS_REGION")))
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("unable to load SDK config, %v", err)
 	}
 
-	http.HandleFunc("/", mainHandler(presigner, "test.txt"))
+	// アプリケーションの中で署名付きURLを生成
+	s3Client := s3.NewPresignClient(s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(os.Getenv("S3_ENDPOINT_URL"))
+	}))
+
+	// Lambdaを呼び出して署名付きURLを生成
+	lambdaClient := lambda.NewFromConfig(cfg, func(o *lambda.Options) {
+		o.BaseEndpoint = aws.String(os.Getenv("OTHER_ENDPOINT_URL"))
+	})
+
+	http.HandleFunc("/", mainHandler(s3Client, lambdaClient, bucket, objectKey))
 
 	log.Println("Server is running on port 8080")
 	http.ListenAndServe(":8080", nil)

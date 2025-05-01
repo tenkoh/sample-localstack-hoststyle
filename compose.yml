@@ -10,6 +10,7 @@ services:
       - DEBUG=1
     volumes:
       - "./localstack/init.sh:/etc/localstack/init/ready.d/init.sh" # 初期化スクリプト
+      - "./dist/lambda.zip:/lambda/lambda.zip" # Lambda関数のzipファイル
       - "./localstack/volume:/var/lib/localstack"
       - "/var/run/docker.sock:/var/run/docker.sock"
     healthcheck:
